@@ -274,8 +274,45 @@ function patchDockMinSize(tui: AnyComp, editorContainer: AnyComp): void {
 /** Agent state shared between the extension (events) and the prompt bar (rendering). */
 const agentState = { working: false, queued: 0 };
 
-/** Transient filter notice shown in the status bar (replaces its content briefly). */
+/**
+ * Transient filter notice shown in the status bar: visible while shift is held
+ * (polled via pi-tui's native platform helper), with a short timer fallback on
+ * platforms where modifier state is unavailable.
+ */
 const filterNotice = { text: "", until: 0, timer: undefined as ReturnType<typeof setTimeout> | undefined };
+
+/**
+ * pi-tui doesn't export native-modifiers from its index, and the extension loader
+ * only aliases bare specifiers, so locate pi's node_modules from the running CLI
+ * entry (process.argv[1] -> .../node_modules/.bin/pi) and load the module directly.
+ */
+let isShiftHeld: (() => boolean) | undefined;
+(async () => {
+	try {
+		const { realpathSync } = await import("node:fs");
+		const nodePath = await import("node:path");
+		const { pathToFileURL } = await import("node:url");
+		const entry = realpathSync(process.argv[1] ?? "");
+		const nmIdx = entry.lastIndexOf(`${nodePath.sep}node_modules${nodePath.sep}`);
+		if (nmIdx < 0) return;
+		const modPath = nodePath.join(
+			entry.slice(0, nmIdx),
+			"node_modules",
+			"@earendil-works",
+			"pi-tui",
+			"dist",
+			"native-modifiers.js",
+		);
+		const mod = (await import(pathToFileURL(modPath).href)) as { isNativeModifierPressed?: (k: string) => boolean };
+		if (typeof mod.isNativeModifierPressed !== "function") return;
+		mod.isNativeModifierPressed("shift"); // probe: throws if the native helper is unusable
+		isShiftHeld = () => mod.isNativeModifierPressed!("shift");
+	} catch {
+		// shift-hold detection unavailable; the notice falls back to a 1s timer
+	}
+})();
+const noticeVisible = () =>
+	filterNotice.text !== "" && (isShiftHeld ? isShiftHeld() : Date.now() < filterNotice.until);
 
 class PromptBarEditor extends CustomEditor {
 	private patched = false;
@@ -376,9 +413,22 @@ export default function (pi: ExtensionAPI) {
 			];
 			const showNotice = (text: string) => {
 				filterNotice.text = text;
-				filterNotice.until = Date.now() + 1000;
-				if (filterNotice.timer) clearTimeout(filterNotice.timer);
-				filterNotice.timer = setTimeout(() => activeTui?.requestRender(), 1050);
+				if (filterNotice.timer) clearInterval(filterNotice.timer);
+				if (isShiftHeld) {
+					// Visible while shift is held: poll and re-render; stop when released.
+					filterNotice.timer = setInterval(() => {
+						if (!isShiftHeld()) {
+							clearInterval(filterNotice.timer!);
+							filterNotice.timer = undefined;
+							filterNotice.text = "";
+						}
+						activeTui?.requestRender();
+					}, 100);
+				} else {
+					// Fallback: fixed 1s.
+					filterNotice.until = Date.now() + 1000;
+					filterNotice.timer = setTimeout(() => activeTui?.requestRender(), 1050);
+				}
 				filterNotice.timer.unref?.();
 			};
 
@@ -436,8 +486,8 @@ export default function (pi: ExtensionAPI) {
 			//    top in prompts-only mode), walk BACKWARD to the nearest surviving block
 			//    above - the prompt that produced it - so the conversation position is
 			//    preserved instead of skipping ahead. Snap the anchor's first line to the
-			//    top of the window; if it can't reach (or nothing anchors), keep the
-			//    snapshot's distance from the bottom of the content instead.
+			//    top of the window; if it can't reach (or nothing anchors), go to the
+			//    bottom of the content.
 			if (snapState.atBottom) {
 				sv.scrollToEnd();
 			} else {
@@ -478,7 +528,10 @@ export default function (pi: ExtensionAPI) {
 				if (seg && seg.y0 <= maxTop) {
 					sv.scrollTo(seg.y0, { disableFollow: true });
 				} else {
-					sv.scrollTo(lines.length - snapState.fromBottom - sv.viewportHeight, { disableFollow: true });
+					// snapState.fromBottom is measured in the OLD layout's lines; applying it to
+					// the new (often much shorter) layout used to clamp the target to 0 - the
+					// top of the whole session. Bottom is the sane destination.
+					sv.scrollTo(maxTop, { disableFollow: true });
 				}
 			}
 			// Record where we left the view; a matching scrollTop on the next press means
@@ -532,7 +585,7 @@ export default function (pi: ExtensionAPI) {
 				invalidate() {},
 				render(width: number): string[] {
 					// Transient filter notice temporarily replaces the whole status line.
-					if (filterNotice.text && Date.now() < filterNotice.until) {
+					if (noticeVisible()) {
 						return [onBar(truncateToWidth(filterNotice.text, width), width)];
 					}
 
@@ -550,9 +603,9 @@ export default function (pi: ExtensionAPI) {
 					const usage = ctx.getContextUsage();
 					const sessionName = ctx.sessionManager.getSessionName();
 					const segments = [
+						...(filterTag ? [filterTag] : []),
 						shortenPath(ctx.cwd),
 						...(sessionName ? [sessionName] : []),
-						...(filterTag ? [filterTag] : []),
 						ctx.model ? ctx.model.id : "no model",
 						pi.getThinkingLevel(),
 						`${usage?.percent != null ? Math.round(usage.percent) : "?"}%`,
